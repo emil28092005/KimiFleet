@@ -8,6 +8,8 @@ sealed class AgentChatEntry
     public string? Status { get; set; }
     public string? ToolKind { get; set; }
     public string? ToolCallId { get; set; }
+    public string? Source { get; set; }
+    public string? Kind { get; set; }
 
     public object Snapshot() => new
     {
@@ -18,6 +20,8 @@ sealed class AgentChatEntry
         title = Title,
         status = Status,
         toolKind = ToolKind,
-        toolCallId = ToolCallId
+        toolCallId = ToolCallId,
+        source = Source,
+        kind = Kind
     };
 }

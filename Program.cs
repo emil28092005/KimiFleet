@@ -53,6 +53,9 @@ sealed class FleetHost : IDisposable
     private readonly ConcurrentDictionary<Guid, Channel<string>> _eventSubscribers = new();
     private readonly List<string> _recentEvents = [];
     private readonly object _eventsLock = new();
+    private readonly List<Handoff> _handoffs = [];
+    private readonly object _handoffsLock = new();
+    private long _handoffId;
     private bool _disposed;
 
     public FleetHost(FleetOptions options)
@@ -95,6 +98,10 @@ sealed class FleetHost : IDisposable
                 await PromptAgentAsync(context, parts[1]);
             else if (context.Request.HttpMethod == "POST" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "review")
                 await ReviewAsync(context, parts[1]);
+            else if (context.Request.HttpMethod == "POST" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "handoff")
+                await BeginHandoffAsync(context, parts[1]);
+            else if (context.Request.HttpMethod == "GET" && path == "handoffs")
+                await RespondJsonAsync(context, ListHandoffs(context.Request.QueryString["agent"]));
             else if (context.Request.HttpMethod == "POST" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "stop")
                 await StopAgentAsync(context, parts[1]);
             else if (context.Request.HttpMethod == "POST" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "cancel")
@@ -133,6 +140,13 @@ sealed class FleetHost : IDisposable
         var request = await ReadJsonAsync<ReviewRequest>(context);
         Review(reviewerName, request.Author, request.Context);
         await RespondJsonAsync(context, new { accepted = true, reviewer = reviewerName, author = request.Author });
+    }
+
+    private async Task BeginHandoffAsync(HttpListenerContext context, string from)
+    {
+        var request = await ReadJsonAsync<HandoffRequest>(context);
+        var handoff = BeginHandoff(from, request.Recipients, request.Kind, request.Title, request.Instructions, request.Message);
+        await RespondJsonAsync(context, handoff, 202);
     }
 
     private async Task StopAgentAsync(HttpListenerContext context, string name)
@@ -198,6 +212,186 @@ sealed class FleetHost : IDisposable
         _ = reviewer.PromptAsync($"Perform peer review for agent '{author.Name}'. Review only; do not edit files. Inspect current git diff and changed files. Check correctness, resource safety, tests, and scope ownership. Report findings by severity with file/line locations. Context: {context ?? "No additional context."}");
     }
     public void Stop(string name) => RemoveAgent(name);
+
+    public object BeginHandoff(string from, string[]? recipients, string? kind, string? title, string? instructions, string? message)
+    {
+        var sender = GetAgent(from);
+        if (!sender.CanReceiveHandoffs)
+            throw new InvalidOperationException($"Source agent '{sender.Name}' has no active Kimi session.");
+        if (string.IsNullOrWhiteSpace(kind) || !Handoff.Kinds.Contains(kind.Trim(), StringComparer.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Handoff kind must be one of: {string.Join(", ", Handoff.Kinds)}.");
+        var normalizedKind = kind.Trim().ToLowerInvariant();
+        if (recipients is null || recipients.Length == 0)
+            throw new InvalidOperationException("Handoff needs at least one recipient.");
+        if (recipients.Length > 32)
+            throw new InvalidOperationException("A handoff supports at most 32 recipients.");
+        var names = new List<string>();
+        foreach (var recipient in recipients)
+        {
+            var name = ValidateName(recipient);
+            if (string.Equals(name, sender.Name, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Sender cannot be a recipient of its own handoff.");
+            if (names.Contains(name, StringComparer.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Duplicate recipient '{name}'.");
+            var target = GetAgent(name);
+            if (!target.CanReceiveHandoffs)
+                throw new InvalidOperationException($"Recipient agent '{name}' has no active Kimi session.");
+            names.Add(name);
+        }
+        if (normalizedKind == "message" && string.IsNullOrWhiteSpace(message))
+            throw new InvalidOperationException("Kind 'message' requires non-empty 'message' text.");
+        var normalizedTitle = NormalizeHandoffField(title, "title", 200);
+        var normalizedInstructions = NormalizeHandoffField(instructions, "instructions", 8_000);
+        var normalizedMessage = NormalizeHandoffField(message, "message", normalizedKind == "message" ? 48_000 : 16_000);
+        var handoff = new Handoff
+        {
+            Id = $"h-{Interlocked.Increment(ref _handoffId)}",
+            Time = DateTimeOffset.UtcNow,
+            From = sender.Name,
+            Recipients = names.ToArray(),
+            Kind = normalizedKind,
+            Title = normalizedTitle,
+            Instructions = normalizedInstructions,
+            Message = normalizedMessage
+        };
+        foreach (var name in names) handoff.Deliveries.Add(new HandoffDelivery { Agent = name });
+        lock (_handoffsLock)
+        {
+            if (_handoffs.Count(h => h.Status is "preparing" or "delivering") >= Handoff.MaxInFlight)
+                throw new InvalidOperationException($"The fleet already has {Handoff.MaxInFlight} handoffs in flight.");
+            _handoffs.Add(handoff);
+            TrimHandoffsLocked();
+        }
+        Publish(sender.Name, "handoff", $"Handoff {handoff.Id} ({normalizedKind}) accepted for {string.Join(", ", names)}.");
+        _ = ProcessHandoffAsync(handoff, sender);
+        lock (_handoffsLock) return handoff.Snapshot();
+    }
+
+    public IReadOnlyList<object> ListHandoffs(string? agent)
+    {
+        lock (_handoffsLock)
+            return _handoffs
+                .Where(h => string.IsNullOrWhiteSpace(agent)
+                    || string.Equals(h.From, agent, StringComparison.OrdinalIgnoreCase)
+                    || h.Recipients.Contains(agent, StringComparer.OrdinalIgnoreCase))
+                .Reverse()
+                .Select(h => (object)h.Snapshot())
+                .ToArray();
+    }
+
+    private async Task ProcessHandoffAsync(Handoff handoff, KimiAgent sender)
+    {
+        try
+        {
+            string package;
+            if (handoff.Kind == "message")
+            {
+                package = handoff.Message!;
+            }
+            else
+            {
+                var produced = await sender.RunHiddenPromptAsync(PackagePrompt(handoff), capture: true);
+                if (string.IsNullOrWhiteSpace(produced))
+                    throw new InvalidOperationException($"Source agent '{sender.Name}' produced no handoff package.");
+                package = produced.Trim();
+                if (handoff.Message is not null) package += $"\n\nNote from {sender.Name}: {handoff.Message}";
+            }
+            lock (_handoffsLock) { handoff.Package = package; handoff.Status = "delivering"; }
+            Publish(handoff.From, "handoff", $"Handoff {handoff.Id} package ready ({package.Length} chars); delivering to {handoff.Deliveries.Count} recipient(s).");
+            await Task.WhenAll(handoff.Deliveries.Select(delivery => DeliverHandoffAsync(handoff, delivery, package)));
+            lock (_handoffsLock)
+            {
+                var failed = handoff.Deliveries.Count(d => d.State == "failed");
+                handoff.Status = failed == 0 ? "delivered" : failed == handoff.Deliveries.Count ? "failed" : "partial";
+                if (handoff.Status != "delivered")
+                    handoff.Error = string.Join("; ", handoff.Deliveries.Where(d => d.Error is not null).Select(d => $"{d.Agent}: {d.Error}"));
+                TrimHandoffsLocked();
+            }
+            Publish(handoff.From, "handoff", $"Handoff {handoff.Id} finished with status '{handoff.Status}'.");
+        }
+        catch (Exception ex)
+        {
+            lock (_handoffsLock)
+            {
+                handoff.Status = "failed";
+                handoff.Error = ex.Message;
+                foreach (var delivery in handoff.Deliveries.Where(d => d.State is "pending" or "delivering"))
+                {
+                    delivery.State = "failed";
+                    delivery.Error = ex.Message;
+                }
+                TrimHandoffsLocked();
+            }
+            Publish(handoff.From, "handoff", $"Handoff {handoff.Id} failed: {ex.Message}");
+        }
+    }
+
+    private async Task DeliverHandoffAsync(Handoff handoff, HandoffDelivery delivery, string package)
+    {
+        try
+        {
+            var recipient = GetAgent(delivery.Agent);
+            var completed = await recipient.RunHiddenPromptAsync(
+                DeliveryPrompt(handoff, package), capture: false,
+                onTurnStart: () =>
+                {
+                    lock (_handoffsLock) delivery.State = "delivering";
+                    recipient.AddHandoffEntry(handoff, package);
+                    Publish(delivery.Agent, "handoff", $"Handoff {handoff.Id} delivery started.");
+                });
+            if (completed is null) throw new InvalidOperationException("Recipient turn failed; see the agent chat for details.");
+            lock (_handoffsLock) delivery.State = "delivered";
+            Publish(delivery.Agent, "handoff", $"Handoff {handoff.Id} from '{handoff.From}' delivered.");
+        }
+        catch (Exception ex)
+        {
+            lock (_handoffsLock) { delivery.State = "failed"; delivery.Error = ex.Message; }
+            Publish(delivery.Agent, "handoff", $"Handoff {handoff.Id} delivery to '{delivery.Agent}' failed: {ex.Message}");
+        }
+    }
+
+    private static string PackagePrompt(Handoff handoff)
+    {
+        var prompt =
+            $"You are handing off work to teammate agents via the KimiFleet context bus (kind: {handoff.Kind}). " +
+            "Produce a compact handoff package (250 words max) with exactly these sections: objective, decisions, constraints, changed files, verification, risks, next steps. " +
+            "Base it on your actual session state and real work so far. Output only the package, no preamble or closing remarks.";
+        if (handoff.Title is not null) prompt += $" Handoff title: {handoff.Title}.";
+        if (handoff.Instructions is not null) prompt += $" Coordinator instructions: {handoff.Instructions}";
+        return prompt;
+    }
+
+    private static string DeliveryPrompt(Handoff handoff, string package)
+    {
+        var header = $"[KimiFleet handoff {handoff.Id} · kind={handoff.Kind} · from={handoff.From}{(handoff.Title is null ? string.Empty : $" · title={handoff.Title}")}]";
+        var directive = handoff.Kind switch
+        {
+            "delegate" => "Continue this work as your own task, autonomously and within your scopes. Do not wait for further instructions.",
+            "review" => "Review this package and report findings by severity with concrete file/line references where possible. Review only; do not edit files.",
+            "message" => "Read the message and respond as appropriate.",
+            _ => "Absorb this context into your working knowledge and acknowledge with one short sentence. Do not start new work unless the package explicitly asks you to."
+        };
+        return $"{header}\n{directive}\n\n{package}";
+    }
+
+    private static string? NormalizeHandoffField(string? value, string name, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = value.Trim();
+        if (normalized.Length > maxLength)
+            throw new InvalidOperationException($"Handoff {name} is limited to {maxLength:N0} characters.");
+        return normalized;
+    }
+
+    private void TrimHandoffsLocked()
+    {
+        while (_handoffs.Count > Handoff.HistoryLimit)
+        {
+            var completedIndex = _handoffs.FindIndex(h => h.Status is "delivered" or "failed" or "partial");
+            if (completedIndex < 0) break;
+            _handoffs.RemoveAt(completedIndex);
+        }
+    }
 
     private KimiAgent GetAgent(string name) =>
         _agents.TryGetValue(name, out var agent) ? agent : throw new InvalidOperationException($"Unknown agent '{name}'.");
@@ -351,6 +545,7 @@ sealed class FleetHost : IDisposable
     private sealed record StartAgentRequest(string Name, string Workspace, string? Role, string[]? Scopes);
     private sealed record PromptRequest(string Prompt);
     private sealed record ReviewRequest(string Author, string? Context);
+    private sealed record HandoffRequest(string[]? Recipients, string? Kind, string? Title, string? Instructions, string? Message);
     private sealed record CompactContextRequest(string? Instructions);
 }
 
@@ -362,6 +557,7 @@ sealed class KimiAgent : IDisposable
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _pending = new();
     private readonly SemaphoreSlim _stdinLock = new(1, 1);
     private readonly SemaphoreSlim _promptGate = new(1, 1);
+    private readonly SemaphoreSlim _turnStateGate = new(1, 1);
     private readonly List<AgentChatEntry> _chat = [];
     private readonly Dictionary<string, AgentChatEntry> _toolEntries = [];
     private readonly object _chatLock = new();
@@ -370,10 +566,12 @@ sealed class KimiAgent : IDisposable
     private long _chatId;
     private long _estimatedTokens;
     private int _queuedPrompts;
-    private int _cancellationRequested;
+    private bool _cancelSent;
     private string? _sessionId;
     private string? _assistantEntryId;
     private string? _thoughtEntryId;
+    private StringBuilder? _captureBuffer;
+    private bool _hideTurnTranscript;
     private bool _resettingContext;
     private bool _disposed;
 
@@ -384,6 +582,7 @@ sealed class KimiAgent : IDisposable
     public string State { get; private set; } = "starting";
     public string Activity { get; private set; } = "Starting ACP session";
     public DateTimeOffset ActivityUpdatedAt { get; private set; } = DateTimeOffset.UtcNow;
+    public bool CanReceiveHandoffs => _sessionId is not null && State is not "starting" and not "stopped" && !_resettingContext && !_disposed;
 
     public KimiAgent(string name, string workspace, string role, IReadOnlyList<string> scopes, FleetOptions options, Action<string, string, string> publish)
     {
@@ -429,62 +628,113 @@ sealed class KimiAgent : IDisposable
         _publish(Name, "initialized", initialized.GetProperty("agentInfo").GetProperty("name").GetString() ?? "Kimi Code CLI");
         var session = await RequestAsync("session/new", new { cwd = Workspace, mcpServers = Array.Empty<object>() });
         _sessionId = session.GetProperty("sessionId").GetString() ?? throw new InvalidOperationException("ACP did not return sessionId.");
+        await SeedFleetContextAsync();
         State = "ready";
         SetActivity("Ready for a task");
         AddChat("system", $"Kimi K3 session ready · {Role}");
         _publish(Name, "ready", $"Role={Role}; scopes={string.Join(", ", Scopes)}");
     }
 
-    public Task PromptAsync(string prompt) => QueuePromptAsync(prompt);
+    public Task PromptAsync(string prompt) => QueuePromptAsync(prompt, hidden: false, capture: false);
 
-    private Task<bool> QueuePromptAsync(string prompt)
+    public Task<string?> RunHiddenPromptAsync(string prompt, bool capture, Action? onTurnStart = null) =>
+        QueuePromptAsync(prompt, hidden: true, capture, onTurnStart);
+
+    private Task<string?> QueuePromptAsync(string prompt, bool hidden, bool capture, Action? onTurnStart = null)
     {
         if (string.IsNullOrWhiteSpace(prompt)) throw new InvalidOperationException("Prompt must not be empty.");
         if (_sessionId is null) throw new InvalidOperationException($"Agent '{Name}' has no ACP session.");
         int queuedCount;
         lock (_promptLifecycleLock)
         {
+            if (State is "starting" or "stopped" || _disposed)
+                throw new InvalidOperationException($"Agent '{Name}' is not ready for prompts.");
             if (_resettingContext) throw new InvalidOperationException("Cannot queue a prompt while context is being reset.");
-            AddChat("user", prompt);
+            if (!hidden) AddChat("user", prompt);
             AddEstimatedTokens(prompt);
             queuedCount = Interlocked.Increment(ref _queuedPrompts);
         }
-        return RunPromptAsync(prompt, queuedCount);
+        return RunPromptAsync(prompt, queuedCount, hidden, capture, onTurnStart);
     }
 
-    private async Task<bool> RunPromptAsync(string prompt, int queuedCount)
+    private async Task<string?> RunPromptAsync(string prompt, int queuedCount, bool hidden, bool capture, Action? onTurnStart)
     {
         if (_promptGate.CurrentCount == 0) _publish(Name, "queued", $"Task queued at position {queuedCount}.");
         await _promptGate.WaitAsync();
         Interlocked.Decrement(ref _queuedPrompts);
+        var captureBuffer = capture ? new StringBuilder() : null;
         try
         {
-            State = "working";
-            SetActivity("Planning assigned task");
-            _publish(Name, "prompt", prompt.Length > 160 ? prompt[..160] + "…" : prompt);
-            await RequestAsync("session/prompt", new { sessionId = _sessionId, prompt = new[] { new { type = "text", text = prompt } } });
-            State = "ready";
-            SetActivity("Ready for a task");
-            var cancelled = Interlocked.Exchange(ref _cancellationRequested, 0) == 1;
+            onTurnStart?.Invoke();
+            await _turnStateGate.WaitAsync();
+            try
+            {
+                _cancelSent = false;
+                SetActivity(hidden ? "Processing a handoff" : "Planning assigned task");
+            }
+            finally { _turnStateGate.Release(); }
+            lock (_chatLock)
+            {
+                _assistantEntryId = null;
+                _thoughtEntryId = null;
+                if (captureBuffer is not null) _captureBuffer = captureBuffer;
+                _hideTurnTranscript = hidden && capture;
+            }
+            var promptResult = await RequestAsync(
+                "session/prompt",
+                new { sessionId = _sessionId, prompt = new[] { new { type = "text", text = prompt } } },
+                onSent: async () =>
+                {
+                    await _turnStateGate.WaitAsync();
+                    try
+                    {
+                        State = "working";
+                        if (!hidden) _publish(Name, "prompt", prompt.Length > 160 ? prompt[..160] + "…" : prompt);
+                    }
+                    finally { _turnStateGate.Release(); }
+                });
+            bool cancelled;
+            await _turnStateGate.WaitAsync();
+            try
+            {
+                cancelled = promptResult.TryGetProperty("stopReason", out var stopReason) && stopReason.GetString() == "cancelled";
+                _cancelSent = false;
+                State = "ready";
+                SetActivity("Ready for a task");
+            }
+            finally { _turnStateGate.Release(); }
             _publish(Name, cancelled ? "cancelled" : "completed", cancelled ? "Task cancelled." : "Prompt completed.");
-            return true;
+            return cancelled ? null : captureBuffer?.ToString() ?? string.Empty;
         }
         catch (Exception ex)
         {
-            Interlocked.Exchange(ref _cancellationRequested, 0);
-            State = "error";
-            SetActivity("Needs attention");
+            await _turnStateGate.WaitAsync();
+            try
+            {
+                _cancelSent = false;
+                State = "error";
+                SetActivity("Needs attention");
+            }
+            finally { _turnStateGate.Release(); }
             AddChat("error", ex.Message);
             _publish(Name, "error", ex.Message);
-            return false;
+            return null;
         }
-        finally { _promptGate.Release(); }
+        finally
+        {
+            lock (_chatLock)
+            {
+                if (captureBuffer is not null) _captureBuffer = null;
+                _hideTurnTranscript = false;
+            }
+            _promptGate.Release();
+        }
     }
 
     public async Task CompactContextAsync(string? instructions)
     {
         var command = string.IsNullOrWhiteSpace(instructions) ? "/compact" : $"/compact {instructions.Trim()}";
-        if (await QueuePromptAsync(command))
+        if (await QueuePromptAsync(command, hidden: false, capture: false) is not null)
         {
             Interlocked.Exchange(ref _estimatedTokens, Math.Min(Interlocked.Read(ref _estimatedTokens), _options.MaxContextTokens / 4));
             AddChat("system", "Context compacted");
@@ -514,6 +764,7 @@ sealed class KimiAgent : IDisposable
                     _thoughtEntryId = null;
                 }
                 Interlocked.Exchange(ref _estimatedTokens, 0);
+                await SeedFleetContextAsync();
                 State = "ready";
                 SetActivity("Ready for a task");
                 AddChat("system", "Fresh Kimi K3 context created");
@@ -527,15 +778,39 @@ sealed class KimiAgent : IDisposable
     public async Task CancelAsync()
     {
         if (_sessionId is null) throw new InvalidOperationException($"Agent '{Name}' has no ACP session.");
-        if (State != "working") throw new InvalidOperationException($"Agent '{Name}' is not working.");
-        await SendRawAsync(JsonSerializer.Serialize(new { jsonrpc = "2.0", method = "session/cancel", @params = new { sessionId = _sessionId } }));
-        Interlocked.Exchange(ref _cancellationRequested, 1);
-        SetActivity("Cancelling current task");
-        AddChat("system", "Cancellation requested");
-        _publish(Name, "cancel", "Cancellation requested.");
+        await _turnStateGate.WaitAsync();
+        try
+        {
+            if (State != "working") throw new InvalidOperationException($"Agent '{Name}' is not working.");
+            if (_cancelSent) throw new InvalidOperationException($"Cancellation is already pending for agent '{Name}'.");
+            await SendRawAsync(JsonSerializer.Serialize(new { jsonrpc = "2.0", method = "session/cancel", @params = new { sessionId = _sessionId } }));
+            _cancelSent = true;
+            SetActivity("Cancelling current task");
+            AddChat("system", "Cancellation requested");
+            _publish(Name, "cancel", "Cancellation requested.");
+        }
+        finally { _turnStateGate.Release(); }
     }
 
-    private async Task<JsonElement> RequestAsync(string method, object parameters)
+    private async Task SeedFleetContextAsync()
+    {
+        var prompt =
+            $"You are KimiFleet agent '{Name}' in a local multi-agent fleet. Your fleet API is http://127.0.0.1:{_options.Port}. " +
+            "You may autonomously coordinate when it materially helps the task: list teammates with GET /agents, and send context with " +
+            $"POST /agents/{Name}/handoff using JSON {{\"recipients\":[\"agent-name\"],\"kind\":\"message|context|delegate|review|broadcast\",\"title\":\"...\",\"instructions\":\"...\",\"message\":\"...\"}}. " +
+            "Use kind=message for direct text; other kinds ask you to summarize this live session before delivery. Use only your own name in the source URL, respect scope ownership, and avoid unnecessary broadcasts. Retain these instructions silently; do not acknowledge them.";
+        AddEstimatedTokens(prompt);
+        lock (_chatLock)
+        {
+            _assistantEntryId = null;
+            _thoughtEntryId = null;
+            _hideTurnTranscript = true;
+        }
+        try { await RequestAsync("session/prompt", new { sessionId = _sessionId, prompt = new[] { new { type = "text", text = prompt } } }); }
+        finally { lock (_chatLock) _hideTurnTranscript = false; }
+    }
+
+    private async Task<JsonElement> RequestAsync(string method, object parameters, Func<Task>? onSent = null)
     {
         var id = Interlocked.Increment(ref _requestId);
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -544,6 +819,7 @@ sealed class KimiAgent : IDisposable
         try
         {
             await SendRawAsync(envelope);
+            if (onSent is not null) await onSent();
             var requestTimeout = method == "session/prompt" ? TimeSpan.FromHours(2) : TimeSpan.FromMinutes(2);
             using var timeout = new CancellationTokenSource(requestTimeout);
             await using var registration = timeout.Token.Register(() => completion.TrySetException(new TimeoutException($"ACP request '{method}' timed out.")));
@@ -702,18 +978,35 @@ sealed class KimiAgent : IDisposable
         if (type == "agent_message_chunk")
         {
             var text = ExtractText(update.TryGetProperty("content", out var content) ? content : default);
-            AppendChatChunk("assistant", text, ref _assistantEntryId);
+            bool hideTranscript;
+            lock (_chatLock) hideTranscript = _hideTurnTranscript;
+            if (!hideTranscript) AppendChatChunk("assistant", text, ref _assistantEntryId);
+            if (!string.IsNullOrEmpty(text))
+            {
+                lock (_chatLock)
+                {
+                    if (_captureBuffer is not null && _captureBuffer.Length < 48_000)
+                    {
+                        var remaining = 48_000 - _captureBuffer.Length;
+                        _captureBuffer.Append(text.AsSpan(0, Math.Min(remaining, text.Length)));
+                    }
+                }
+            }
             AddEstimatedTokens(text);
         }
         else if (type == "agent_thought_chunk")
         {
             var text = ExtractText(update.TryGetProperty("content", out var content) ? content : default);
-            AppendChatChunk("thought", text, ref _thoughtEntryId);
+            bool hideTranscript;
+            lock (_chatLock) hideTranscript = _hideTurnTranscript;
+            if (!hideTranscript) AppendChatChunk("thought", text, ref _thoughtEntryId);
             AddEstimatedTokens(text);
         }
         else if (type is "tool_call" or "tool_call_update")
         {
-            UpsertToolEntry(update);
+            bool hideTranscript;
+            lock (_chatLock) hideTranscript = _hideTurnTranscript;
+            if (!hideTranscript) UpsertToolEntry(update);
             _assistantEntryId = null;
             _thoughtEntryId = null;
         }
@@ -774,6 +1067,20 @@ sealed class KimiAgent : IDisposable
                 _assistantEntryId = null;
                 _thoughtEntryId = null;
             }
+        }
+    }
+
+    public void AddHandoffEntry(Handoff handoff, string package)
+    {
+        lock (_chatLock)
+        {
+            var entry = NewChatEntry("handoff", LimitText(package, 48_000));
+            entry.Title = handoff.Title ?? $"{handoff.Kind} from {handoff.From}";
+            entry.Source = handoff.From;
+            entry.Kind = handoff.Kind;
+            AddChatEntryLocked(entry);
+            _assistantEntryId = null;
+            _thoughtEntryId = null;
         }
     }
 

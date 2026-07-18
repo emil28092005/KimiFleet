@@ -61,6 +61,10 @@ sealed class McpStdioServer(FleetHost fleet)
                 "fleet_compact_context" => Compact(Required(arguments, "agent"), Optional(arguments, "instructions")),
                 "fleet_reset_context" => await Reset(Required(arguments, "agent")),
                 "fleet_request_review" => Review(Required(arguments, "reviewer"), Required(arguments, "author"), Optional(arguments, "context")),
+                "fleet_handoff_context" => fleet.BeginHandoff(
+                    Required(arguments, "from"), RequiredArray(arguments, "recipients"), Required(arguments, "kind"),
+                    Optional(arguments, "title"), Optional(arguments, "instructions"), Optional(arguments, "message")),
+                "fleet_list_handoffs" => fleet.ListHandoffs(Optional(arguments, "agent")),
                 "fleet_stop_agent" => Stop(Required(arguments, "agent")),
                 _ => throw new InvalidOperationException($"Unknown KimiFleet tool '{name}'.")
             };
@@ -119,6 +123,12 @@ sealed class McpStdioServer(FleetHost fleet)
         input.TryGetProperty(name, out var values) && values.ValueKind == JsonValueKind.Array
             ? values.EnumerateArray().Where(x => x.ValueKind == JsonValueKind.String).Select(x => x.GetString()!).ToArray() : null;
 
+    private static string[] RequiredArray(JsonElement input, string name)
+    {
+        var values = StringArray(input, name);
+        return values is { Length: > 0 } ? values : throw new InvalidOperationException($"'{name}' must be a non-empty array of agent names.");
+    }
+
     private static async Task SendAsync(JsonElement id, object result)
     {
         var json = $"{{\"jsonrpc\":\"2.0\",\"id\":{id.GetRawText()},\"result\":{JsonSerializer.Serialize(result, Json)}}}";
@@ -136,7 +146,9 @@ sealed class McpStdioServer(FleetHost fleet)
         Tool("fleet_compact_context", "Compact an agent context while preserving important decisions and active work.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" }, instructions = new { type = "string" } } }),
         Tool("fleet_reset_context", "Create a fresh ACP context for an idle agent without changing files or scope ownership.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } }),
         Tool("fleet_request_review", "Ask a second agent for read-only peer review of an author's current diff.", new { type = "object", required = new[] { "reviewer", "author" }, properties = new { reviewer = new { type = "string" }, author = new { type = "string" }, context = new { type = "string" } } }),
-        Tool("fleet_stop_agent", "Stop an agent and release its exclusive scopes.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } })
+        Tool("fleet_stop_agent", "Stop an agent and release its exclusive scopes.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } }),
+        Tool("fleet_handoff_context", "Send agent-to-agent context over the fleet bus and return the accepted handoff record. kind 'message' delivers trimmed text without source summarization. For 'context', 'delegate', 'review' and 'broadcast', the source Kimi summarizes its live session into a structured package and KimiFleet injects it into every recipient's model context, consuming their token budgets.", new { type = "object", required = new[] { "from", "recipients", "kind" }, properties = new { from = new { type = "string", description = "Name of the sending agent." }, recipients = new { type = "array", minItems = 1, maxItems = 32, items = new { type = "string" }, description = "Names of the agents that receive the handoff." }, kind = new { type = "string", @enum = new[] { "message", "context", "delegate", "review", "broadcast" }, description = "'message' = direct text; other kinds = source-generated context package injected into recipient contexts." }, title = new { type = "string", maxLength = 200, description = "Short subject; labels the handoff and generated package." }, instructions = new { type = "string", maxLength = 8000, description = "Guidance for the source summary and the recipients' next action." }, message = new { type = "string", maxLength = 48000, description = "Required text for kind 'message' (48k max); optional extra detail for generated kinds (16k max)." } } }),
+        Tool("fleet_list_handoffs", "List handoffs recorded on the fleet bus; pass 'agent' to keep only handoffs sent by or addressed to that agent.", new { type = "object", properties = new { agent = new { type = "string" } } })
     ];
 
     private static object Tool(string name, string description, object inputSchema) => new { name, description, inputSchema };
