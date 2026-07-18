@@ -288,6 +288,8 @@ sealed class KimiAgent : IDisposable
     public string Role { get; }
     public IReadOnlyList<string> Scopes { get; }
     public string State { get; private set; } = "starting";
+    public string Activity { get; private set; } = "Starting ACP session";
+    public DateTimeOffset ActivityUpdatedAt { get; private set; } = DateTimeOffset.UtcNow;
 
     public KimiAgent(string name, string workspace, string role, IReadOnlyList<string> scopes, FleetOptions options, Action<string, string, string> publish)
     {
@@ -319,6 +321,7 @@ sealed class KimiAgent : IDisposable
 
     public async Task StartAsync()
     {
+        SetActivity("Initializing ACP session");
         if (!_process.Start()) throw new InvalidOperationException($"Could not start Kimi process for '{Name}'.");
         _process.Exited += (_, _) => { State = "stopped"; _publish(Name, "exit", $"Kimi exited with {_process.ExitCode}."); };
         _ = ReadOutputAsync();
@@ -333,6 +336,7 @@ sealed class KimiAgent : IDisposable
         var session = await RequestAsync("session/new", new { cwd = Workspace, mcpServers = Array.Empty<object>() });
         _sessionId = session.GetProperty("sessionId").GetString() ?? throw new InvalidOperationException("ACP did not return sessionId.");
         State = "ready";
+        SetActivity("Ready for a task");
         _publish(Name, "ready", $"Role={Role}; scopes={string.Join(", ", Scopes)}");
     }
 
@@ -341,16 +345,19 @@ sealed class KimiAgent : IDisposable
         if (string.IsNullOrWhiteSpace(prompt)) throw new InvalidOperationException("Prompt must not be empty.");
         if (_sessionId is null) throw new InvalidOperationException($"Agent '{Name}' has no ACP session.");
         State = "working";
+        SetActivity("Planning assigned task");
         _publish(Name, "prompt", prompt.Length > 160 ? prompt[..160] + "…" : prompt);
         try
         {
             await RequestAsync("session/prompt", new { sessionId = _sessionId, prompt = new[] { new { type = "text", text = prompt } } });
             State = "ready";
+            SetActivity("Ready for a task");
             _publish(Name, "completed", "Prompt completed.");
         }
         catch (Exception ex)
         {
             State = "error";
+            SetActivity("Needs attention");
             _publish(Name, "error", ex.Message);
         }
     }
@@ -406,15 +413,36 @@ sealed class KimiAgent : IDisposable
                 if (methodName == "session/request_permission" && root.TryGetProperty("id", out var permissionId) && root.TryGetProperty("params", out var permission))
                 {
                     var optionId = SelectApproval(permission);
+                    SetActivity("Approving requested action");
                     _ = RespondToPermissionAsync(permissionId.GetRawText(), optionId);
                     _publish(Name, "permission", $"Auto-approved '{optionId}' (yolo mode).");
                     return;
                 }
+                if (methodName == "session/update" && root.TryGetProperty("params", out var updateParams))
+                    UpdateActivityFromSessionUpdate(updateParams);
                 _publish(Name, methodName, root.TryGetProperty("params", out var p) ? p.GetRawText() : string.Empty);
             }
             else _publish(Name, "protocol", line);
         }
         catch (JsonException) { _publish(Name, "stdout", line); }
+    }
+
+    private void UpdateActivityFromSessionUpdate(JsonElement parameters)
+    {
+        if (!parameters.TryGetProperty("update", out var update) || !update.TryGetProperty("sessionUpdate", out var typeNode)) return;
+        var type = typeNode.GetString();
+        if ((type == "tool_call" || type == "tool_call_update") && update.TryGetProperty("title", out var title) && !string.IsNullOrWhiteSpace(title.GetString()))
+            SetActivity(title.GetString()!);
+        else if (type == "agent_thought_chunk" && !Activity.StartsWith("Reading", StringComparison.OrdinalIgnoreCase) && !Activity.StartsWith("Running", StringComparison.OrdinalIgnoreCase))
+            SetActivity("Analyzing task");
+        else if (type == "agent_message_chunk")
+            SetActivity("Preparing a report");
+    }
+
+    private void SetActivity(string value)
+    {
+        Activity = value;
+        ActivityUpdatedAt = DateTimeOffset.UtcNow;
     }
 
     private static string SelectApproval(JsonElement permission)
@@ -446,7 +474,7 @@ sealed class KimiAgent : IDisposable
         finally { _stdinLock.Release(); }
     }
 
-    public object Snapshot() => new { name = Name, workspace = Workspace, role = Role, scopes = Scopes, state = State, sessionId = _sessionId };
+    public object Snapshot() => new { name = Name, workspace = Workspace, role = Role, scopes = Scopes, state = State, activity = Activity, activityUpdatedAt = ActivityUpdatedAt, sessionId = _sessionId };
 
     public void Dispose()
     {
