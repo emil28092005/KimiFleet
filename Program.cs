@@ -248,11 +248,16 @@ sealed class FleetHost : IDisposable
             using var document = JsonDocument.Parse(message);
             var update = document.RootElement.GetProperty("update");
             var type = update.GetProperty("sessionUpdate").GetString();
-            if (type == "tool_call_update") return $"{update.GetProperty("title").GetString()} — {update.GetProperty("status").GetString()}";
+            if (type == "tool_call_update")
+            {
+                var title = update.TryGetProperty("title", out var titleNode) ? titleNode.GetString() : null;
+                var status = update.TryGetProperty("status", out var statusNode) ? statusNode.GetString() : null;
+                return $"{title ?? "Tool call"} — {status ?? "updated"}";
+            }
             if (type == "agent_message_chunk") return "Kimi sent a response";
             return type ?? "session update";
         }
-        catch (JsonException) { return "session update"; }
+        catch (Exception) { return "session update"; }
     }
 
     public void Dispose()
@@ -369,7 +374,8 @@ sealed class KimiAgent : IDisposable
         if (!_pending.TryAdd(id, completion)) throw new InvalidOperationException("Could not register ACP request.");
         var envelope = JsonSerializer.Serialize(new { jsonrpc = "2.0", id, method, @params = parameters });
         await SendRawAsync(envelope);
-        using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+        var requestTimeout = method == "session/prompt" ? TimeSpan.FromHours(2) : TimeSpan.FromMinutes(2);
+        using var timeout = new CancellationTokenSource(requestTimeout);
         await using var registration = timeout.Token.Register(() => completion.TrySetException(new TimeoutException($"ACP request '{method}' timed out.")));
         return await completion.Task;
     }
@@ -400,6 +406,20 @@ sealed class KimiAgent : IDisposable
         {
             using var document = JsonDocument.Parse(line);
             var root = document.RootElement;
+            if (root.TryGetProperty("method", out var method))
+            {
+                var methodName = method.GetString() ?? "notification";
+                if (root.TryGetProperty("id", out var requestId))
+                {
+                    var parameters = root.TryGetProperty("params", out var requestParams) ? requestParams.Clone() : default;
+                    _ = HandleClientRequestAsync(methodName, requestId.GetRawText(), parameters);
+                    return;
+                }
+                if (methodName == "session/update" && root.TryGetProperty("params", out var updateParams))
+                    UpdateActivityFromSessionUpdate(updateParams);
+                _publish(Name, methodName, root.TryGetProperty("params", out var p) ? p.GetRawText() : string.Empty);
+                return;
+            }
             if (root.TryGetProperty("id", out var idNode) && idNode.TryGetInt64(out var id) && _pending.TryRemove(id, out var completion))
             {
                 if (root.TryGetProperty("error", out var error)) completion.TrySetException(new InvalidOperationException(error.GetRawText()));
@@ -407,24 +427,78 @@ sealed class KimiAgent : IDisposable
                 else completion.TrySetException(new InvalidOperationException("ACP response has neither result nor error."));
                 return;
             }
-            if (root.TryGetProperty("method", out var method))
-            {
-                var methodName = method.GetString() ?? "notification";
-                if (methodName == "session/request_permission" && root.TryGetProperty("id", out var permissionId) && root.TryGetProperty("params", out var permission))
-                {
-                    var optionId = SelectApproval(permission);
-                    SetActivity("Approving requested action");
-                    _ = RespondToPermissionAsync(permissionId.GetRawText(), optionId);
-                    _publish(Name, "permission", $"Auto-approved '{optionId}' (yolo mode).");
-                    return;
-                }
-                if (methodName == "session/update" && root.TryGetProperty("params", out var updateParams))
-                    UpdateActivityFromSessionUpdate(updateParams);
-                _publish(Name, methodName, root.TryGetProperty("params", out var p) ? p.GetRawText() : string.Empty);
-            }
-            else _publish(Name, "protocol", line);
+            _publish(Name, "protocol", line);
         }
-        catch (JsonException) { _publish(Name, "stdout", line); }
+        catch (Exception ex)
+        {
+            _publish(Name, "protocol-error", ex.Message);
+            _publish(Name, "stdout", line);
+        }
+    }
+
+    private async Task HandleClientRequestAsync(string method, string requestId, JsonElement parameters)
+    {
+        try
+        {
+            object result;
+            switch (method)
+            {
+                case "session/request_permission":
+                    var optionId = SelectApproval(parameters);
+                    SetActivity("Approving requested action");
+                    _publish(Name, "permission", $"Auto-approved '{optionId}' (yolo mode).");
+                    result = new { outcome = new { outcome = "selected", optionId } };
+                    break;
+                case "fs/read_text_file":
+                    var readPath = ResolveWorkspacePath(parameters);
+                    SetActivity($"Reading {Path.GetFileName(readPath)}");
+                    _publish(Name, "file", $"Reading {Path.GetRelativePath(Workspace, readPath)}");
+                    result = new { content = await File.ReadAllTextAsync(readPath) };
+                    break;
+                case "fs/write_text_file":
+                    var writePath = ResolveWorkspacePath(parameters);
+                    EnsureWritableScope(writePath);
+                    if (!parameters.TryGetProperty("content", out var contentNode) || contentNode.ValueKind != JsonValueKind.String)
+                        throw new InvalidOperationException("ACP write request has no text content.");
+                    Directory.CreateDirectory(Path.GetDirectoryName(writePath)!);
+                    await File.WriteAllTextAsync(writePath, contentNode.GetString()!);
+                    SetActivity($"Editing {Path.GetFileName(writePath)}");
+                    _publish(Name, "file", $"Updated {Path.GetRelativePath(Workspace, writePath)}");
+                    result = new { };
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported ACP client request '{method}'.");
+            }
+            await SendResultAsync(requestId, result);
+        }
+        catch (Exception ex)
+        {
+            _publish(Name, "client-error", $"{method}: {ex.Message}");
+            await SendErrorAsync(requestId, ex.Message);
+        }
+    }
+
+    private string ResolveWorkspacePath(JsonElement parameters)
+    {
+        if (!parameters.TryGetProperty("path", out var pathNode) || pathNode.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(pathNode.GetString()))
+            throw new InvalidOperationException("ACP filesystem request has no path.");
+        var requested = pathNode.GetString()!;
+        var fullPath = Path.GetFullPath(Path.IsPathRooted(requested) ? requested : Path.Combine(Workspace, requested));
+        if (!IsWithin(fullPath, Workspace)) throw new UnauthorizedAccessException("ACP filesystem request escaped the agent workspace.");
+        return fullPath;
+    }
+
+    private void EnsureWritableScope(string path)
+    {
+        if (Scopes.Count == 0) return;
+        if (Scopes.Any(scope => IsWithin(path, Path.GetFullPath(Path.Combine(Workspace, scope))))) return;
+        throw new UnauthorizedAccessException("ACP write request is outside the agent's exclusive scopes.");
+    }
+
+    private static bool IsWithin(string path, string directory)
+    {
+        var relative = Path.GetRelativePath(directory, path);
+        return relative != ".." && !relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal);
     }
 
     private void UpdateActivityFromSessionUpdate(JsonElement parameters)
@@ -460,8 +534,11 @@ sealed class KimiAgent : IDisposable
             ?? throw new InvalidOperationException("ACP permission request has no approval option.");
     }
 
-    private Task RespondToPermissionAsync(string requestId, string optionId) =>
-        SendRawAsync($"{{\"jsonrpc\":\"2.0\",\"id\":{requestId},\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":{JsonSerializer.Serialize(optionId)}}}}}}}");
+    private Task SendResultAsync(string requestId, object result) =>
+        SendRawAsync($"{{\"jsonrpc\":\"2.0\",\"id\":{requestId},\"result\":{JsonSerializer.Serialize(result)}}}");
+
+    private Task SendErrorAsync(string requestId, string message) =>
+        SendRawAsync($"{{\"jsonrpc\":\"2.0\",\"id\":{requestId},\"error\":{{\"code\":-32000,\"message\":{JsonSerializer.Serialize(message)}}}}}");
 
     private async Task SendRawAsync(string json)
     {
