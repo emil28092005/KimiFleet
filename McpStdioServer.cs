@@ -9,6 +9,7 @@ sealed class McpStdioServer(FleetHost fleet)
         string? line;
         while ((line = await Console.In.ReadLineAsync()) is not null)
         {
+            var responseId = "null";
             try
             {
                 using var document = JsonDocument.Parse(line);
@@ -16,6 +17,7 @@ sealed class McpStdioServer(FleetHost fleet)
                 if (!request.TryGetProperty("method", out var methodNode)) continue;
                 var method = methodNode.GetString();
                 if (!request.TryGetProperty("id", out var id)) continue; // notifications have no response
+                responseId = id.GetRawText();
                 object result = method switch
                 {
                     "initialize" => new
@@ -25,6 +27,7 @@ sealed class McpStdioServer(FleetHost fleet)
                         serverInfo = new { name = "KimiFleet", version = "0.1.0" },
                         instructions = "Use KimiFleet tools to create scoped Kimi K3 agents, assign work, and require peer review."
                     },
+                    "ping" => new { },
                     "tools/list" => new { tools = Tools },
                     "tools/call" => await CallToolAsync(request.GetProperty("params")),
                     _ => throw new InvalidOperationException($"Unsupported MCP method '{method}'.")
@@ -34,7 +37,7 @@ sealed class McpStdioServer(FleetHost fleet)
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"[mcp] {ex.Message}");
-                await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new { jsonrpc = "2.0", error = new { code = -32603, message = ex.Message } }, Json));
+                await Console.Out.WriteLineAsync($"{{\"jsonrpc\":\"2.0\",\"id\":{responseId},\"error\":{JsonSerializer.Serialize(new { code = -32603, message = ex.Message }, Json)}}}");
                 await Console.Out.FlushAsync();
             }
         }
@@ -42,20 +45,31 @@ sealed class McpStdioServer(FleetHost fleet)
 
     private async Task<object> CallToolAsync(JsonElement call)
     {
-        var name = call.GetProperty("name").GetString() ?? throw new InvalidOperationException("Tool call has no name.");
-        var arguments = call.TryGetProperty("arguments", out var value) ? value : default;
-        object payload = name switch
+        try
         {
-            "fleet_list_agents" => fleet.ListAgents(),
-            "fleet_start_agent" => await fleet.StartAgentAsync(new FleetHost.AgentSpec(
-                Required(arguments, "name"), Required(arguments, "workspace"),
-                Optional(arguments, "role"), StringArray(arguments, "scopes"))),
-            "fleet_assign_task" => Assign(Required(arguments, "agent"), Required(arguments, "prompt")),
-            "fleet_request_review" => Review(Required(arguments, "reviewer"), Required(arguments, "author"), Optional(arguments, "context")),
-            "fleet_stop_agent" => Stop(Required(arguments, "agent")),
-            _ => throw new InvalidOperationException($"Unknown KimiFleet tool '{name}'.")
-        };
-        return new { content = new[] { new { type = "text", text = JsonSerializer.Serialize(payload, Json) } } };
+            var name = call.GetProperty("name").GetString() ?? throw new InvalidOperationException("Tool call has no name.");
+            var arguments = call.TryGetProperty("arguments", out var value) ? value : default;
+            object payload = name switch
+            {
+                "fleet_list_agents" => fleet.ListAgents(),
+                "fleet_start_agent" => await fleet.StartAgentAsync(new FleetHost.AgentSpec(
+                    Required(arguments, "name"), Required(arguments, "workspace"),
+                    Optional(arguments, "role"), StringArray(arguments, "scopes"))),
+                "fleet_get_chat" => fleet.GetChat(Required(arguments, "agent")),
+                "fleet_assign_task" => Assign(Required(arguments, "agent"), Required(arguments, "prompt")),
+                "fleet_cancel_task" => await Cancel(Required(arguments, "agent")),
+                "fleet_compact_context" => Compact(Required(arguments, "agent"), Optional(arguments, "instructions")),
+                "fleet_reset_context" => await Reset(Required(arguments, "agent")),
+                "fleet_request_review" => Review(Required(arguments, "reviewer"), Required(arguments, "author"), Optional(arguments, "context")),
+                "fleet_stop_agent" => Stop(Required(arguments, "agent")),
+                _ => throw new InvalidOperationException($"Unknown KimiFleet tool '{name}'.")
+            };
+            return new { content = new[] { new { type = "text", text = JsonSerializer.Serialize(payload, Json) } } };
+        }
+        catch (Exception ex)
+        {
+            return new { content = new[] { new { type = "text", text = ex.Message } }, isError = true };
+        }
     }
 
     private object Assign(string agent, string prompt)
@@ -68,6 +82,24 @@ sealed class McpStdioServer(FleetHost fleet)
     {
         fleet.Review(reviewer, author, context);
         return new { accepted = true, reviewer, author };
+    }
+
+    private object Compact(string agent, string? instructions)
+    {
+        fleet.Compact(agent, instructions);
+        return new { accepted = true, agent, operation = "compact" };
+    }
+
+    private async Task<object> Cancel(string agent)
+    {
+        await fleet.Cancel(agent);
+        return new { accepted = true, agent, operation = "cancel" };
+    }
+
+    private async Task<object> Reset(string agent)
+    {
+        await fleet.ResetContext(agent);
+        return new { accepted = true, agent, operation = "reset" };
     }
 
     private object Stop(string agent)
@@ -98,7 +130,11 @@ sealed class McpStdioServer(FleetHost fleet)
     [
         Tool("fleet_list_agents", "List active Kimi K3 agents, their roles, scope locks and state.", new { type = "object", properties = new { } }),
         Tool("fleet_start_agent", "Start a yolo Kimi K3 ACP agent with exclusive source scopes.", new { type = "object", required = new[] { "name", "workspace" }, properties = new { name = new { type = "string" }, workspace = new { type = "string" }, role = new { type = "string" }, scopes = new { type = "array", items = new { type = "string" } } } }),
+        Tool("fleet_get_chat", "Get the complete visible chat and tool-call transcript for an agent.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } }),
         Tool("fleet_assign_task", "Assign an autonomous task to an active Kimi agent.", new { type = "object", required = new[] { "agent", "prompt" }, properties = new { agent = new { type = "string" }, prompt = new { type = "string" } } }),
+        Tool("fleet_cancel_task", "Cancel the task currently running in a Kimi agent.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } }),
+        Tool("fleet_compact_context", "Compact an agent context while preserving important decisions and active work.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" }, instructions = new { type = "string" } } }),
+        Tool("fleet_reset_context", "Create a fresh ACP context for an idle agent without changing files or scope ownership.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } }),
         Tool("fleet_request_review", "Ask a second agent for read-only peer review of an author's current diff.", new { type = "object", required = new[] { "reviewer", "author" }, properties = new { reviewer = new { type = "string" }, author = new { type = "string" }, context = new { type = "string" } } }),
         Tool("fleet_stop_agent", "Stop an agent and release its exclusive scopes.", new { type = "object", required = new[] { "agent" }, properties = new { agent = new { type = "string" } } })
     ];

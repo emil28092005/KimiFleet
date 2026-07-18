@@ -22,22 +22,24 @@ if (options.EnableMcp)
 else
     await webTask;
 
-sealed record FleetOptions(int Port, string KimiExecutable, string Model, bool EnableMcp)
+sealed record FleetOptions(int Port, string KimiExecutable, string Model, int MaxContextTokens, bool EnableMcp)
 {
     public static FleetOptions Parse(string[] args)
     {
         var port = 7373;
         var kimi = "kimi";
         var model = "kimi-code/k3";
+        var maxContextTokens = 256_000;
         var enableMcp = false;
         for (var i = 0; i < args.Length; i++)
         {
             if (args[i] == "--port" && i + 1 < args.Length && int.TryParse(args[++i], out var value)) port = value;
             else if (args[i] == "--kimi" && i + 1 < args.Length) kimi = args[++i];
             else if (args[i] == "--model" && i + 1 < args.Length) model = args[++i];
+            else if (args[i] == "--context-size" && i + 1 < args.Length && int.TryParse(args[++i], out var contextSize) && contextSize > 0) maxContextTokens = contextSize;
             else if (args[i] == "--mcp") enableMcp = true;
         }
-        return new FleetOptions(port, kimi, model, enableMcp);
+        return new FleetOptions(port, kimi, model, maxContextTokens, enableMcp);
     }
 }
 
@@ -47,6 +49,7 @@ sealed class FleetHost : IDisposable
     private readonly HttpListener _listener = new();
     private readonly ConcurrentDictionary<string, KimiAgent> _agents = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _scopeOwners = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _agentsLock = new();
     private readonly ConcurrentDictionary<Guid, Channel<string>> _eventSubscribers = new();
     private readonly List<string> _recentEvents = [];
     private readonly object _eventsLock = new();
@@ -82,6 +85,8 @@ sealed class FleetHost : IDisposable
                 await RespondJsonAsync(context, new { ok = true, model = _options.Model });
             else if (context.Request.HttpMethod == "GET" && path == "agents")
                 await RespondJsonAsync(context, _agents.Values.Select(a => a.Snapshot()));
+            else if (context.Request.HttpMethod == "GET" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "chat")
+                await RespondJsonAsync(context, GetChat(parts[1]));
             else if (context.Request.HttpMethod == "GET" && path == "events")
                 await StreamEventsAsync(context);
             else if (context.Request.HttpMethod == "POST" && path == "agents")
@@ -92,6 +97,12 @@ sealed class FleetHost : IDisposable
                 await ReviewAsync(context, parts[1]);
             else if (context.Request.HttpMethod == "POST" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "stop")
                 await StopAgentAsync(context, parts[1]);
+            else if (context.Request.HttpMethod == "POST" && parts.Length == 3 && parts[0] == "agents" && parts[2] == "cancel")
+                await CancelAgentAsync(context, parts[1]);
+            else if (context.Request.HttpMethod == "POST" && parts.Length == 4 && parts[0] == "agents" && parts[2] == "context" && parts[3] == "compact")
+                await CompactContextAsync(context, parts[1]);
+            else if (context.Request.HttpMethod == "POST" && parts.Length == 4 && parts[0] == "agents" && parts[2] == "context" && parts[3] == "reset")
+                await ResetContextAsync(context, parts[1]);
             else
                 await RespondJsonAsync(context, new { error = "Unknown endpoint." }, 404);
         }
@@ -130,24 +141,56 @@ sealed class FleetHost : IDisposable
         await RespondJsonAsync(context, new { stopped = name });
     }
 
+    private async Task CancelAgentAsync(HttpListenerContext context, string name)
+    {
+        await Cancel(name);
+        await RespondJsonAsync(context, new { accepted = true, agent = name, operation = "cancel" });
+    }
+
+    private async Task CompactContextAsync(HttpListenerContext context, string name)
+    {
+        var request = await ReadJsonAsync<CompactContextRequest>(context);
+        Compact(name, request.Instructions);
+        await RespondJsonAsync(context, new { accepted = true, agent = name, operation = "compact" });
+    }
+
+    private async Task ResetContextAsync(HttpListenerContext context, string name)
+    {
+        await ResetContext(name);
+        await RespondJsonAsync(context, new { accepted = true, agent = name, operation = "reset" });
+    }
+
     public async Task<object> StartAgentAsync(AgentSpec spec)
     {
         var name = ValidateName(spec.Name);
         var workspace = Path.GetFullPath(spec.Workspace);
         if (!Directory.Exists(workspace)) throw new InvalidOperationException($"Workspace does not exist: {workspace}");
-        if (_agents.ContainsKey(name)) throw new InvalidOperationException($"Agent '{name}' already exists.");
-        var scopes = spec.Scopes?.Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? [];
-        foreach (var scope in scopes)
-            if (_scopeOwners.TryGetValue(scope, out var owner)) throw new InvalidOperationException($"Scope '{scope}' is owned by '{owner}'.");
-        var agent = new KimiAgent(name, workspace, spec.Role ?? "worker", scopes, _options, Publish);
-        if (!_agents.TryAdd(name, agent)) throw new InvalidOperationException($"Could not add '{name}'.");
-        foreach (var scope in scopes) _scopeOwners[scope] = name;
+        var scopes = NormalizeScopes(workspace, spec.Scopes);
+        KimiAgent agent;
+        lock (_agentsLock)
+        {
+            if (_agents.ContainsKey(name)) throw new InvalidOperationException($"Agent '{name}' already exists.");
+            foreach (var scope in scopes)
+            {
+                var scopePath = Path.GetFullPath(Path.Combine(workspace, scope));
+                var conflict = _scopeOwners.FirstOrDefault(pair => PathsOverlap(scopePath, pair.Key));
+                if (!string.IsNullOrEmpty(conflict.Key))
+                    throw new InvalidOperationException($"Scope '{scope}' overlaps a scope owned by '{conflict.Value}'.");
+            }
+            agent = new KimiAgent(name, workspace, spec.Role ?? "worker", scopes, _options, Publish);
+            if (!_agents.TryAdd(name, agent)) throw new InvalidOperationException($"Could not add '{name}'.");
+            foreach (var scope in scopes) _scopeOwners[Path.GetFullPath(Path.Combine(workspace, scope))] = name;
+        }
         try { await agent.StartAsync(); return agent.Snapshot(); }
         catch { RemoveAgent(name); throw; }
     }
 
     public IReadOnlyList<object> ListAgents() => _agents.Values.Select(a => a.Snapshot()).Cast<object>().ToArray();
+    public IReadOnlyList<object> GetChat(string name) => GetAgent(name).ChatSnapshot();
     public void Assign(string name, string prompt) => _ = GetAgent(name).PromptAsync(prompt);
+    public void Compact(string name, string? instructions) => _ = GetAgent(name).CompactContextAsync(instructions);
+    public Task Cancel(string name) => GetAgent(name).CancelAsync();
+    public Task ResetContext(string name) => GetAgent(name).ResetContextAsync();
     public void Review(string reviewerName, string authorName, string? context)
     {
         var reviewer = GetAgent(reviewerName);
@@ -161,10 +204,38 @@ sealed class FleetHost : IDisposable
 
     private void RemoveAgent(string name)
     {
-        if (!_agents.TryRemove(name, out var agent)) return;
-        foreach (var scope in agent.Scopes) _scopeOwners.TryRemove(scope, out _);
+        KimiAgent? agent;
+        lock (_agentsLock)
+        {
+            if (!_agents.TryRemove(name, out agent)) return;
+            foreach (var scope in agent.Scopes)
+                _scopeOwners.TryRemove(Path.GetFullPath(Path.Combine(agent.Workspace, scope)), out _);
+        }
         agent.Dispose();
         Publish(name, "stopped", "Agent stopped.");
+    }
+
+    private static string[] NormalizeScopes(string workspace, string[]? requestedScopes)
+    {
+        if (requestedScopes is null) return [];
+        var scopes = new List<string>();
+        foreach (var requested in requestedScopes)
+        {
+            if (string.IsNullOrWhiteSpace(requested)) continue;
+            var fullPath = Path.GetFullPath(Path.Combine(workspace, requested.Trim()));
+            if (!IsWithin(fullPath, workspace)) throw new InvalidOperationException($"Scope escaped the workspace: {requested}");
+            var relative = Path.GetRelativePath(workspace, fullPath);
+            if (!scopes.Contains(relative, StringComparer.OrdinalIgnoreCase)) scopes.Add(relative);
+        }
+        return scopes.ToArray();
+    }
+
+    private static bool PathsOverlap(string left, string right) => IsWithin(left, right) || IsWithin(right, left);
+
+    private static bool IsWithin(string path, string directory)
+    {
+        var relative = Path.GetRelativePath(directory, path);
+        return relative != ".." && !relative.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal);
     }
 
     private static string ValidateName(string? name)
@@ -207,7 +278,12 @@ sealed class FleetHost : IDisposable
         context.Response.SendChunked = true;
         context.Response.Headers.Add("Cache-Control", "no-cache");
         var id = Guid.NewGuid();
-        var channel = Channel.CreateUnbounded<string>();
+        var channel = Channel.CreateBounded<string>(new BoundedChannelOptions(256)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false
+        });
         _eventSubscribers[id] = channel;
         try
         {
@@ -275,6 +351,7 @@ sealed class FleetHost : IDisposable
     private sealed record StartAgentRequest(string Name, string Workspace, string? Role, string[]? Scopes);
     private sealed record PromptRequest(string Prompt);
     private sealed record ReviewRequest(string Author, string? Context);
+    private sealed record CompactContextRequest(string? Instructions);
 }
 
 sealed class KimiAgent : IDisposable
@@ -284,8 +361,20 @@ sealed class KimiAgent : IDisposable
     private readonly Process _process;
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _pending = new();
     private readonly SemaphoreSlim _stdinLock = new(1, 1);
+    private readonly SemaphoreSlim _promptGate = new(1, 1);
+    private readonly List<AgentChatEntry> _chat = [];
+    private readonly Dictionary<string, AgentChatEntry> _toolEntries = [];
+    private readonly object _chatLock = new();
+    private readonly object _promptLifecycleLock = new();
     private long _requestId;
+    private long _chatId;
+    private long _estimatedTokens;
+    private int _queuedPrompts;
+    private int _cancellationRequested;
     private string? _sessionId;
+    private string? _assistantEntryId;
+    private string? _thoughtEntryId;
+    private bool _resettingContext;
     private bool _disposed;
 
     public string Name { get; }
@@ -328,7 +417,7 @@ sealed class KimiAgent : IDisposable
     {
         SetActivity("Initializing ACP session");
         if (!_process.Start()) throw new InvalidOperationException($"Could not start Kimi process for '{Name}'.");
-        _process.Exited += (_, _) => { State = "stopped"; _publish(Name, "exit", $"Kimi exited with {_process.ExitCode}."); };
+        _process.Exited += (_, _) => HandleProcessExit();
         _ = ReadOutputAsync();
         _ = ReadErrorAsync();
         var initialized = await RequestAsync("initialize", new
@@ -342,29 +431,108 @@ sealed class KimiAgent : IDisposable
         _sessionId = session.GetProperty("sessionId").GetString() ?? throw new InvalidOperationException("ACP did not return sessionId.");
         State = "ready";
         SetActivity("Ready for a task");
+        AddChat("system", $"Kimi K3 session ready · {Role}");
         _publish(Name, "ready", $"Role={Role}; scopes={string.Join(", ", Scopes)}");
     }
 
-    public async Task PromptAsync(string prompt)
+    public Task PromptAsync(string prompt) => QueuePromptAsync(prompt);
+
+    private Task<bool> QueuePromptAsync(string prompt)
     {
         if (string.IsNullOrWhiteSpace(prompt)) throw new InvalidOperationException("Prompt must not be empty.");
         if (_sessionId is null) throw new InvalidOperationException($"Agent '{Name}' has no ACP session.");
-        State = "working";
-        SetActivity("Planning assigned task");
-        _publish(Name, "prompt", prompt.Length > 160 ? prompt[..160] + "…" : prompt);
+        int queuedCount;
+        lock (_promptLifecycleLock)
+        {
+            if (_resettingContext) throw new InvalidOperationException("Cannot queue a prompt while context is being reset.");
+            AddChat("user", prompt);
+            AddEstimatedTokens(prompt);
+            queuedCount = Interlocked.Increment(ref _queuedPrompts);
+        }
+        return RunPromptAsync(prompt, queuedCount);
+    }
+
+    private async Task<bool> RunPromptAsync(string prompt, int queuedCount)
+    {
+        if (_promptGate.CurrentCount == 0) _publish(Name, "queued", $"Task queued at position {queuedCount}.");
+        await _promptGate.WaitAsync();
+        Interlocked.Decrement(ref _queuedPrompts);
         try
         {
+            State = "working";
+            SetActivity("Planning assigned task");
+            _publish(Name, "prompt", prompt.Length > 160 ? prompt[..160] + "…" : prompt);
             await RequestAsync("session/prompt", new { sessionId = _sessionId, prompt = new[] { new { type = "text", text = prompt } } });
             State = "ready";
             SetActivity("Ready for a task");
-            _publish(Name, "completed", "Prompt completed.");
+            var cancelled = Interlocked.Exchange(ref _cancellationRequested, 0) == 1;
+            _publish(Name, cancelled ? "cancelled" : "completed", cancelled ? "Task cancelled." : "Prompt completed.");
+            return true;
         }
         catch (Exception ex)
         {
+            Interlocked.Exchange(ref _cancellationRequested, 0);
             State = "error";
             SetActivity("Needs attention");
+            AddChat("error", ex.Message);
             _publish(Name, "error", ex.Message);
+            return false;
         }
+        finally { _promptGate.Release(); }
+    }
+
+    public async Task CompactContextAsync(string? instructions)
+    {
+        var command = string.IsNullOrWhiteSpace(instructions) ? "/compact" : $"/compact {instructions.Trim()}";
+        if (await QueuePromptAsync(command))
+        {
+            Interlocked.Exchange(ref _estimatedTokens, Math.Min(Interlocked.Read(ref _estimatedTokens), _options.MaxContextTokens / 4));
+            AddChat("system", "Context compacted");
+            _publish(Name, "context", "Context compacted.");
+        }
+    }
+
+    public async Task ResetContextAsync()
+    {
+        if (!await _promptGate.WaitAsync(0)) throw new InvalidOperationException("Cannot reset context while the agent is working.");
+        try
+        {
+            lock (_promptLifecycleLock)
+            {
+                if (Volatile.Read(ref _queuedPrompts) > 0) throw new InvalidOperationException("Cannot reset context while prompts are queued.");
+                _resettingContext = true;
+            }
+            try
+            {
+                var session = await RequestAsync("session/new", new { cwd = Workspace, mcpServers = Array.Empty<object>() });
+                _sessionId = session.GetProperty("sessionId").GetString() ?? throw new InvalidOperationException("ACP did not return sessionId.");
+                lock (_chatLock)
+                {
+                    _chat.Clear();
+                    _toolEntries.Clear();
+                    _assistantEntryId = null;
+                    _thoughtEntryId = null;
+                }
+                Interlocked.Exchange(ref _estimatedTokens, 0);
+                State = "ready";
+                SetActivity("Ready for a task");
+                AddChat("system", "Fresh Kimi K3 context created");
+                _publish(Name, "context", "Context reset.");
+            }
+            finally { lock (_promptLifecycleLock) _resettingContext = false; }
+        }
+        finally { _promptGate.Release(); }
+    }
+
+    public async Task CancelAsync()
+    {
+        if (_sessionId is null) throw new InvalidOperationException($"Agent '{Name}' has no ACP session.");
+        if (State != "working") throw new InvalidOperationException($"Agent '{Name}' is not working.");
+        await SendRawAsync(JsonSerializer.Serialize(new { jsonrpc = "2.0", method = "session/cancel", @params = new { sessionId = _sessionId } }));
+        Interlocked.Exchange(ref _cancellationRequested, 1);
+        SetActivity("Cancelling current task");
+        AddChat("system", "Cancellation requested");
+        _publish(Name, "cancel", "Cancellation requested.");
     }
 
     private async Task<JsonElement> RequestAsync(string method, object parameters)
@@ -373,11 +541,15 @@ sealed class KimiAgent : IDisposable
         var completion = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         if (!_pending.TryAdd(id, completion)) throw new InvalidOperationException("Could not register ACP request.");
         var envelope = JsonSerializer.Serialize(new { jsonrpc = "2.0", id, method, @params = parameters });
-        await SendRawAsync(envelope);
-        var requestTimeout = method == "session/prompt" ? TimeSpan.FromHours(2) : TimeSpan.FromMinutes(2);
-        using var timeout = new CancellationTokenSource(requestTimeout);
-        await using var registration = timeout.Token.Register(() => completion.TrySetException(new TimeoutException($"ACP request '{method}' timed out.")));
-        return await completion.Task;
+        try
+        {
+            await SendRawAsync(envelope);
+            var requestTimeout = method == "session/prompt" ? TimeSpan.FromHours(2) : TimeSpan.FromMinutes(2);
+            using var timeout = new CancellationTokenSource(requestTimeout);
+            await using var registration = timeout.Token.Register(() => completion.TrySetException(new TimeoutException($"ACP request '{method}' timed out.")));
+            return await completion.Task;
+        }
+        finally { _pending.TryRemove(id, out _); }
     }
 
     private async Task ReadOutputAsync()
@@ -416,7 +588,10 @@ sealed class KimiAgent : IDisposable
                     return;
                 }
                 if (methodName == "session/update" && root.TryGetProperty("params", out var updateParams))
+                {
                     UpdateActivityFromSessionUpdate(updateParams);
+                    UpdateChatFromSessionUpdate(updateParams);
+                }
                 _publish(Name, methodName, root.TryGetProperty("params", out var p) ? p.GetRawText() : string.Empty);
                 return;
             }
@@ -446,6 +621,7 @@ sealed class KimiAgent : IDisposable
                 case "session/request_permission":
                     var optionId = SelectApproval(parameters);
                     SetActivity("Approving requested action");
+                    AddChat("system", "Permission approved automatically");
                     _publish(Name, "permission", $"Auto-approved '{optionId}' (yolo mode).");
                     result = new { outcome = new { outcome = "selected", optionId } };
                     break;
@@ -453,7 +629,9 @@ sealed class KimiAgent : IDisposable
                     var readPath = ResolveWorkspacePath(parameters);
                     SetActivity($"Reading {Path.GetFileName(readPath)}");
                     _publish(Name, "file", $"Reading {Path.GetRelativePath(Workspace, readPath)}");
-                    result = new { content = await File.ReadAllTextAsync(readPath) };
+                    var fileContent = await File.ReadAllTextAsync(readPath);
+                    AddEstimatedTokens(fileContent);
+                    result = new { content = fileContent };
                     break;
                 case "fs/write_text_file":
                     var writePath = ResolveWorkspacePath(parameters);
@@ -462,6 +640,7 @@ sealed class KimiAgent : IDisposable
                         throw new InvalidOperationException("ACP write request has no text content.");
                     Directory.CreateDirectory(Path.GetDirectoryName(writePath)!);
                     await File.WriteAllTextAsync(writePath, contentNode.GetString()!);
+                    AddEstimatedTokens(contentNode.GetString()!);
                     SetActivity($"Editing {Path.GetFileName(writePath)}");
                     _publish(Name, "file", $"Updated {Path.GetRelativePath(Workspace, writePath)}");
                     result = new { };
@@ -506,12 +685,134 @@ sealed class KimiAgent : IDisposable
         if (!parameters.TryGetProperty("update", out var update) || !update.TryGetProperty("sessionUpdate", out var typeNode)) return;
         var type = typeNode.GetString();
         if ((type == "tool_call" || type == "tool_call_update") && update.TryGetProperty("title", out var title) && !string.IsNullOrWhiteSpace(title.GetString()))
-            SetActivity(title.GetString()!);
-        else if (type == "agent_thought_chunk" && !Activity.StartsWith("Reading", StringComparison.OrdinalIgnoreCase) && !Activity.StartsWith("Running", StringComparison.OrdinalIgnoreCase))
+        {
+            var status = update.TryGetProperty("status", out var statusNode) ? statusNode.GetString() : null;
+            SetActivity(status is "completed" or "failed" ? "Reviewing tool result" : title.GetString()!);
+        }
+        else if (type == "agent_thought_chunk")
             SetActivity("Analyzing task");
         else if (type == "agent_message_chunk")
             SetActivity("Preparing a report");
     }
+
+    private void UpdateChatFromSessionUpdate(JsonElement parameters)
+    {
+        if (!parameters.TryGetProperty("update", out var update) || !update.TryGetProperty("sessionUpdate", out var typeNode)) return;
+        var type = typeNode.GetString();
+        if (type == "agent_message_chunk")
+        {
+            var text = ExtractText(update.TryGetProperty("content", out var content) ? content : default);
+            AppendChatChunk("assistant", text, ref _assistantEntryId);
+            AddEstimatedTokens(text);
+        }
+        else if (type == "agent_thought_chunk")
+        {
+            var text = ExtractText(update.TryGetProperty("content", out var content) ? content : default);
+            AppendChatChunk("thought", text, ref _thoughtEntryId);
+            AddEstimatedTokens(text);
+        }
+        else if (type is "tool_call" or "tool_call_update")
+        {
+            UpsertToolEntry(update);
+            _assistantEntryId = null;
+            _thoughtEntryId = null;
+        }
+    }
+
+    private void UpsertToolEntry(JsonElement update)
+    {
+        if (!update.TryGetProperty("toolCallId", out var idNode) || string.IsNullOrWhiteSpace(idNode.GetString())) return;
+        var toolCallId = idNode.GetString()!;
+        lock (_chatLock)
+        {
+            if (!_toolEntries.TryGetValue(toolCallId, out var entry))
+            {
+                entry = NewChatEntry("tool", string.Empty);
+                entry.ToolCallId = toolCallId;
+                _toolEntries[toolCallId] = entry;
+                AddChatEntryLocked(entry);
+            }
+            if (update.TryGetProperty("title", out var title) && !string.IsNullOrWhiteSpace(title.GetString())) entry.Title = title.GetString();
+            if (update.TryGetProperty("status", out var status) && !string.IsNullOrWhiteSpace(status.GetString())) entry.Status = status.GetString();
+            if (update.TryGetProperty("kind", out var kind) && !string.IsNullOrWhiteSpace(kind.GetString())) entry.ToolKind = kind.GetString();
+            if (update.TryGetProperty("content", out var content))
+            {
+                var text = ExtractText(content);
+                if (!string.IsNullOrWhiteSpace(text)) entry.Text = LimitText(text, 12_000);
+            }
+        }
+    }
+
+    private void AppendChatChunk(string type, string text, ref string? activeEntryId)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        lock (_chatLock)
+        {
+            AgentChatEntry? entry = null;
+            if (activeEntryId is not null)
+            {
+                for (var i = _chat.Count - 1; i >= 0; i--)
+                    if (_chat[i].Id == activeEntryId) { entry = _chat[i]; break; }
+            }
+            if (entry is null)
+            {
+                entry = NewChatEntry(type, string.Empty);
+                AddChatEntryLocked(entry);
+                activeEntryId = entry.Id;
+            }
+            entry.Text = LimitText(entry.Text + text, 48_000);
+        }
+    }
+
+    private void AddChat(string type, string text)
+    {
+        lock (_chatLock)
+        {
+            AddChatEntryLocked(NewChatEntry(type, LimitText(text, 48_000)));
+            if (type == "user")
+            {
+                _assistantEntryId = null;
+                _thoughtEntryId = null;
+            }
+        }
+    }
+
+    private AgentChatEntry NewChatEntry(string type, string text) => new()
+    {
+        Id = $"{Name}-{Interlocked.Increment(ref _chatId)}",
+        Time = DateTimeOffset.UtcNow,
+        Type = type,
+        Text = text
+    };
+
+    private void AddChatEntryLocked(AgentChatEntry entry)
+    {
+        _chat.Add(entry);
+        while (_chat.Count > 500)
+        {
+            var removed = _chat[0];
+            _chat.RemoveAt(0);
+            if (removed.ToolCallId is not null) _toolEntries.Remove(removed.ToolCallId);
+        }
+    }
+
+    private static string ExtractText(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Undefined || value.ValueKind == JsonValueKind.Null) return string.Empty;
+        if (value.ValueKind == JsonValueKind.String) return value.GetString() ?? string.Empty;
+        if (value.ValueKind == JsonValueKind.Array) return string.Concat(value.EnumerateArray().Select(ExtractText));
+        if (value.ValueKind != JsonValueKind.Object) return string.Empty;
+        if (value.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String) return text.GetString() ?? string.Empty;
+        if (value.TryGetProperty("content", out var content)) return ExtractText(content);
+        return string.Empty;
+    }
+
+    private void AddEstimatedTokens(string text)
+    {
+        if (!string.IsNullOrEmpty(text)) Interlocked.Add(ref _estimatedTokens, Math.Max(1, text.Length / 4));
+    }
+
+    private static string LimitText(string text, int maxLength) => text.Length <= maxLength ? text : $"…{text[^maxLength..]}";
 
     private void SetActivity(string value)
     {
@@ -551,14 +852,59 @@ sealed class KimiAgent : IDisposable
         finally { _stdinLock.Release(); }
     }
 
-    public object Snapshot() => new { name = Name, workspace = Workspace, role = Role, scopes = Scopes, state = State, activity = Activity, activityUpdatedAt = ActivityUpdatedAt, sessionId = _sessionId };
+    public IReadOnlyList<object> ChatSnapshot()
+    {
+        lock (_chatLock) return _chat.Select(entry => entry.Snapshot()).ToArray();
+    }
+
+    public object Snapshot()
+    {
+        var estimatedTokens = Interlocked.Read(ref _estimatedTokens);
+        return new
+        {
+            name = Name,
+            workspace = Workspace,
+            role = Role,
+            scopes = Scopes,
+            state = State,
+            activity = Activity,
+            activityUpdatedAt = ActivityUpdatedAt,
+            queueDepth = Volatile.Read(ref _queuedPrompts),
+            contextTokens = estimatedTokens,
+            maxContextTokens = _options.MaxContextTokens,
+            contextPercent = Math.Round(Math.Min(100d, estimatedTokens * 100d / _options.MaxContextTokens), 1),
+            sessionId = _sessionId
+        };
+    }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        try { if (!_process.HasExited) _process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
-        _stdinLock.Dispose();
+        FailPending(new ObjectDisposedException(Name, "Agent stopped."));
+        try
+        {
+            if (!_process.HasExited) _process.Kill(entireProcessTree: true);
+            _process.WaitForExit(2_000);
+        }
+        catch (InvalidOperationException) { }
         _process.Dispose();
+    }
+
+    private void HandleProcessExit()
+    {
+        State = "stopped";
+        SetActivity("Kimi process stopped");
+        var exitCode = 0;
+        try { exitCode = _process.ExitCode; } catch (Exception) when (_disposed) { }
+        var error = new InvalidOperationException($"Kimi process exited with code {exitCode}.");
+        FailPending(error);
+        _publish(Name, "exit", error.Message);
+    }
+
+    private void FailPending(Exception error)
+    {
+        foreach (var request in _pending.ToArray())
+            if (_pending.TryRemove(request.Key, out var completion)) completion.TrySetException(error);
     }
 }
