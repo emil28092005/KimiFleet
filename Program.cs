@@ -292,7 +292,7 @@ sealed class FleetHost : IDisposable
             {
                 var produced = await sender.RunHiddenPromptAsync(PackagePrompt(handoff), capture: true);
                 if (string.IsNullOrWhiteSpace(produced))
-                    throw new InvalidOperationException($"Source agent '{sender.Name}' produced no handoff package.");
+                    throw new InvalidOperationException(sender.LastError ?? $"Source agent '{sender.Name}' produced no handoff package.");
                 package = produced.Trim();
                 if (handoff.Message is not null) package += $"\n\nNote from {sender.Name}: {handoff.Message}";
             }
@@ -339,7 +339,7 @@ sealed class FleetHost : IDisposable
                     recipient.AddHandoffEntry(handoff, package);
                     Publish(delivery.Agent, "handoff", $"Handoff {handoff.Id} delivery started.");
                 });
-            if (completed is null) throw new InvalidOperationException("Recipient turn failed; see the agent chat for details.");
+            if (completed is null) throw new InvalidOperationException(recipient.LastError ?? "Recipient turn failed; see the agent chat for details.");
             lock (_handoffsLock) delivery.State = "delivered";
             Publish(delivery.Agent, "handoff", $"Handoff {handoff.Id} from '{handoff.From}' delivered.");
         }
@@ -565,6 +565,9 @@ sealed class KimiAgent : IDisposable
     private long _requestId;
     private long _chatId;
     private long _estimatedTokens;
+    private long _turnMeaningfulUpdateCount;
+    private long _turnAssistantMessageCount;
+    private int _isPromptTurnActive;
     private int _queuedPrompts;
     private bool _cancelSent;
     private string? _sessionId;
@@ -582,7 +585,8 @@ sealed class KimiAgent : IDisposable
     public string State { get; private set; } = "starting";
     public string Activity { get; private set; } = "Starting ACP session";
     public DateTimeOffset ActivityUpdatedAt { get; private set; } = DateTimeOffset.UtcNow;
-    public bool CanReceiveHandoffs => _sessionId is not null && State is not "starting" and not "stopped" && !_resettingContext && !_disposed;
+    public string? LastError { get; private set; }
+    public bool CanReceiveHandoffs => _sessionId is not null && State is not "starting" and not "stopped" and not "error" && !_resettingContext && !_disposed;
 
     public KimiAgent(string name, string workspace, string role, IReadOnlyList<string> scopes, FleetOptions options, Action<string, string, string> publish)
     {
@@ -680,6 +684,9 @@ sealed class KimiAgent : IDisposable
                 if (captureBuffer is not null) _captureBuffer = captureBuffer;
                 _hideTurnTranscript = hidden && capture;
             }
+            Interlocked.Exchange(ref _turnMeaningfulUpdateCount, 0);
+            Interlocked.Exchange(ref _turnAssistantMessageCount, 0);
+            Volatile.Write(ref _isPromptTurnActive, 1);
             var promptResult = await RequestAsync(
                 "session/prompt",
                 new { sessionId = _sessionId, prompt = new[] { new { type = "text", text = prompt } } },
@@ -698,7 +705,16 @@ sealed class KimiAgent : IDisposable
             try
             {
                 cancelled = promptResult.TryGetProperty("stopReason", out var stopReason) && stopReason.GetString() == "cancelled";
+                if (!cancelled && capture && Interlocked.Read(ref _turnAssistantMessageCount) == 0)
+                    throw new InvalidOperationException(
+                        "Kimi ended the turn without an assistant message. " +
+                        "The provider may be out of quota or unauthenticated; verify it with `kimi --model kimi-code/k3 --prompt \"Reply: OK\"`.");
+                if (!cancelled && !capture && Interlocked.Read(ref _turnMeaningfulUpdateCount) == 0)
+                    throw new InvalidOperationException(
+                        "Kimi ended the turn without any text, thought, or tool output. " +
+                        "The provider may be out of quota or unauthenticated; verify it with `kimi --model kimi-code/k3 --prompt \"Reply: OK\"`.");
                 _cancelSent = false;
+                LastError = null;
                 State = "ready";
                 SetActivity("Ready for a task");
             }
@@ -712,6 +728,7 @@ sealed class KimiAgent : IDisposable
             try
             {
                 _cancelSent = false;
+                LastError = ex.Message;
                 State = "error";
                 SetActivity("Needs attention");
             }
@@ -722,6 +739,7 @@ sealed class KimiAgent : IDisposable
         }
         finally
         {
+            Volatile.Write(ref _isPromptTurnActive, 0);
             lock (_chatLock)
             {
                 if (captureBuffer is not null) _captureBuffer = null;
@@ -973,11 +991,15 @@ sealed class KimiAgent : IDisposable
 
     private void UpdateChatFromSessionUpdate(JsonElement parameters)
     {
+        if (parameters.TryGetProperty("sessionId", out var sessionId) &&
+            !string.Equals(sessionId.GetString(), _sessionId, StringComparison.Ordinal))
+            return;
         if (!parameters.TryGetProperty("update", out var update) || !update.TryGetProperty("sessionUpdate", out var typeNode)) return;
         var type = typeNode.GetString();
         if (type == "agent_message_chunk")
         {
             var text = ExtractText(update.TryGetProperty("content", out var content) ? content : default);
+            TrackMeaningfulUpdate(text, isAssistantMessage: true);
             bool hideTranscript;
             lock (_chatLock) hideTranscript = _hideTurnTranscript;
             if (!hideTranscript) AppendChatChunk("assistant", text, ref _assistantEntryId);
@@ -997,6 +1019,7 @@ sealed class KimiAgent : IDisposable
         else if (type == "agent_thought_chunk")
         {
             var text = ExtractText(update.TryGetProperty("content", out var content) ? content : default);
+            TrackMeaningfulUpdate(text);
             bool hideTranscript;
             lock (_chatLock) hideTranscript = _hideTurnTranscript;
             if (!hideTranscript) AppendChatChunk("thought", text, ref _thoughtEntryId);
@@ -1004,12 +1027,22 @@ sealed class KimiAgent : IDisposable
         }
         else if (type is "tool_call" or "tool_call_update")
         {
+            if (update.TryGetProperty("toolCallId", out var toolCallId) && !string.IsNullOrWhiteSpace(toolCallId.GetString()))
+                TrackMeaningfulUpdate(toolCallId.GetString()!);
             bool hideTranscript;
             lock (_chatLock) hideTranscript = _hideTurnTranscript;
             if (!hideTranscript) UpsertToolEntry(update);
             _assistantEntryId = null;
             _thoughtEntryId = null;
         }
+    }
+
+    private void TrackMeaningfulUpdate(string value, bool isAssistantMessage = false)
+    {
+        if (Volatile.Read(ref _isPromptTurnActive) == 0 || string.IsNullOrWhiteSpace(value)) return;
+        Interlocked.Increment(ref _turnMeaningfulUpdateCount);
+        if (isAssistantMessage)
+            Interlocked.Increment(ref _turnAssistantMessageCount);
     }
 
     private void UpsertToolEntry(JsonElement update)
